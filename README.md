@@ -26,9 +26,9 @@ conda env create -f environment.yml
 | Flag            | Options     | Default |Info        |
 | --------------- | ----------- | :-------: |----------|
 | `--data_root` | String     | "../datasets/" | path to data directory |
-| `--model_name`   | String | "cnn"|
-| `--R` | Float     | 0.55 |
-|`--non_iid` | 1: Non-IID |
+| `--model_name`   | String | "cnn"|Used Model
+| `--R` | Float     | 0.55 | Distance between client
+|`--non_iid` | 1: Non-IID | Type of data
 | `--n_clients` | Int     | 30 | number of the clients |
 | `--n_shards` | Int     | 200 | number of shards |
 | `--n_epochs` | Int     | 50 | total number of rounds |

@@ -1,6 +1,7 @@
 ## Overview
 
 Reference de base de ce travail [FedAvg](https://github.com/naderAsadi/FedAvg) 
+L'architecture du système proposé dans ce projet se structure autour de trois composantes principales. Premièrement, le clustering est utilisé afin d’organiser les clients participants au FL et faciliter la gestion des interactions et la collaboration au sein des groupes (ou clusters). Deuxièmement, l’apprentissage fédéré dans chaque cluster se base sur la technique SAC pour une collaboration sécurisée entre les clients. Troisièmement, l’intégration de la technologie blockchain joue un rôle essentiel dans la préservation de la transparence et de la traçabilité des mises à jour du modèle global tout au long du processus d’apprentissage
 
 ## Installation
 

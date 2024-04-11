@@ -27,6 +27,7 @@ conda env create -f environment.yml
 | --------------- | ----------- | :-------: |----------|
 | `--data_root` | String     | "../datasets/" | path to data directory |
 | `--model_name`   | String | "cnn"|
+| `--R` | Float     | 0.55 |
 |`--non_iid` | 1: Non-IID |
 | `--n_clients` | Int     | 30 | number of the clients |
 | `--n_shards` | Int     | 200 | number of shards |
@@ -35,6 +36,6 @@ conda env create -f environment.yml
 | `--batch_size` | Int     | 10 | batch size |
 | `--lr` | Float     | 0.01 | leanring-rate |
 | `--wandb` | Bool     | False | log the results to WandB |
-| `--R` | Float     | 0.55 |
+
 
 

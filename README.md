@@ -31,7 +31,7 @@ conda env create -f environment.yml
 | `--data_root` | String     | "../datasets/" | path to data directory |
 | `--model_name`   | String | "cnn"|Used Model
 | `--R` | Float     | 0.55 | Distance between client
-|`--non_iid` | 1: Non-IID | Type of data
+|`--non_iid` | Int (0 or 1) | 1 | 0: IID, 1: Non-IID |
 | `--n_clients` | Int     | 30 | number of the clients |
 | `--n_shards` | Int     | 200 | number of shards |
 | `--n_epochs` | Int     | 50 | total number of rounds |

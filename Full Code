@@ -1,0 +1,1107 @@
+import hashlib
+from multiprocessing import Process
+import pickle
+import random
+import socket
+import sys
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple
+import copy
+from matplotlib import pyplot as plt
+import numpy as np
+from sklearn.metrics import f1_score, precision_score
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from sklearn.cluster import KMeans
+from threading import Lock
+
+
+from data import MNISTDataset, FederatedSampler
+import data
+from models import CNN, MLP
+from utils import arg_parser, average_weights, Logger
+from queue import Queue
+
+class FedAvg:
+    """Implementation of FedAvg
+    http://proceedings.mlr.press/v54/mcmahan17a/mcmahan17a.pdf
+    """
+
+    def __init__(self, args: Dict[str, Any]): #Initialisation des arguments ,le dispositif de calcul , les ensembles de données et le modèle
+        self.args = args
+        self.device = torch.device(
+            f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
+        )
+        self.logger = Logger(args)
+
+        self.train_loader, self.test_loader = self._get_data( #Obtient les ensembles de données d'entraînement et de test en appelant la méthode _get_data
+            root=self.args.data_root,
+            n_clients=self.args.n_clients,
+            n_shards=self.args.n_shards,
+            non_iid=self.args.non_iid,
+        )
+
+        if self.args.model_name == "mlp":
+            self.avrg = MLP(input_size=784, hidden_size=128, n_classes=10).to(
+                self.device
+            )
+            self.target_acc = 0.97
+        elif self.args.model_name == "cnn":
+            self.avrg = CNN(n_channels=1, n_classes=10).to(self.device)
+            self.target_acc = 0.99
+        else:
+            raise ValueError(f"Invalid model name, {self.args.model_name}")
+
+        self.reached_target_at = None  # type: int
+
+    def _get_data( #Charge les données d'entraînement et de test
+        self, root: str, n_clients: int, n_shards: int, non_iid: int
+    ) -> Tuple[DataLoader, DataLoader]:
+        """
+        Args:
+            root (str): path to the dataset.
+            n_clients (int): number of clients.
+            n_shards (int): number of shards.
+            non_iid (int): 0: IID, 1: Non-IID
+
+        Returns:
+            Tuple[DataLoader, DataLoader]: train_loader, test_loader
+        """
+        train_set = MNISTDataset(root=root, train=True)
+        test_set = MNISTDataset(root=root, train=False)
+
+        sampler = FederatedSampler(
+            train_set, non_iid=non_iid, n_clients=n_clients, n_shards=n_shards
+        )
+
+        train_loader = DataLoader(train_set, batch_size=128, sampler=sampler)
+        test_loader = DataLoader(test_set, batch_size=128)
+
+        return train_loader, test_loader
+
+    def _train_client( #Entraine le modèle pour un client spécifique et retourne le modèle et la perte moyenne
+        self, avrg: nn.Module, train_loader: DataLoader, client_idx: int
+    ) -> Tuple[nn.Module, float]:
+        """Train a client model.
+
+        Args:
+            avrg (nn.Module): server model.
+            train_loader (DataLoader): client data loader.
+            client_idx (int): client index.
+
+        Returns:
+            Tuple[nn.Module, float]: client model, average client loss.
+        """
+        model = copy.deepcopy(avrg)
+        model.train()
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=self.args.lr, momentum=self.args.momentum
+        )
+
+        for epoch in range(self.args.n_client_epochs):
+            epoch_loss = 0.0
+            epoch_correct = 0
+            epoch_samples = 0
+
+            for idx, (data, target) in enumerate(train_loader):
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+
+                logits = model(data)
+                loss = F.nll_loss(logits, target)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                epoch_correct += (logits.argmax(dim=1) == target).sum().item()
+                epoch_samples += data.size(0)
+
+            # Calculate average accuracy and loss
+            epoch_loss /= idx
+            epoch_acc = epoch_correct / epoch_samples
+
+            print(
+                f"Client #{client_idx} | Epoch: {epoch}/{self.args.n_client_epochs} | Loss: {epoch_loss} | Acc: {epoch_acc}",
+                end="\r",
+            )
+
+        return model, epoch_loss / self.args.n_client_epochs
+
+   
+
+    def test(self) -> Tuple[float, float, float, float]:#Tester le modèle du serveur et retourne la perte et la précision moyennes.
+        """Test the server model.
+
+        Returns:
+            Tuple[float, float]: average loss, average accuracy, f1 score, precision.
+        """
+        self.avrg.eval()
+
+        total_loss = 0.0
+        total_correct = 0.0
+        total_samples = 0
+        true_positives = 0
+        false_positives = 0
+        false_negatives = 0
+        all_targets = []
+        all_predictions = []
+
+       
+
+        for idx, (data, target) in enumerate(self.test_loader):
+            data, target = data.to(self.device), target.to(self.device)
+
+            logits = self.avrg(data)
+            loss = F.nll_loss(logits, target)
+            preds = logits.argmax(dim=1)
+
+            total_loss += loss.item()
+            total_correct += (logits.argmax(dim=1) == target).sum().item()
+            total_samples += data.size(0)
+            true_positives += ((preds == 1) & (target == 1)).sum().item()
+            false_positives += ((preds == 1) & (target == 0)).sum().item()
+            false_negatives += ((preds == 0) & (target == 1)).sum().item()
+
+
+            all_targets.extend(target.cpu().numpy())
+            all_predictions.extend(preds.cpu().numpy())
+            
+        f1 = f1_score(all_targets, all_predictions, average='weighted')
+
+        # calculate average accuracy and loss
+        total_loss /= idx
+        total_acc = total_correct / total_samples
+        # precision = true_positives / (true_positives + false_positives) if true_positives + false_positives > 0 else 0
+        precision = precision_score(all_targets, all_predictions, average='weighted', zero_division=0)
+
+        return total_loss, total_acc, f1, precision
+
+class Block:
+    v=0
+    def __init__(self, previous_hash, data, client_id):
+        self.timestamp = time.time()
+        self.added_to_ledger_timestamp = None
+        self.data = data
+        self.client_id = client_id
+        self.previous_hash = previous_hash
+        self.hash = self.calculate_hash()
+        self.shared = False
+    def calculate_hash(self):
+        data_str = f"{self.timestamp}{str(self.data)}{str(self.client_id)}{self.previous_hash}"
+        return hashlib.sha256(data_str.encode()).hexdigest()
+
+class FedAvgClustered(FedAvg):
+    
+   
+    def create_server_socket(self, coord, port):
+     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+     try:
+        server_socket.bind(('127.0.0.1', port))
+        server_socket.listen(1)
+
+        while True:
+            conn, addr = server_socket.accept()
+            received_data = b""
+            try:
+                while True:
+                    chunk = conn.recv(4096)  # Utilisez un buffer plus petit pour recevoir des données
+                    if not chunk:
+                        break
+                    received_data += chunk
+                self.total_data_received += len(received_data)
+                received_data = pickle.loads(received_data)
+             #   print(f"{coord} (port {port}) received distributed_weights: {received_data}")
+                
+                
+            
+            except Exception as e:
+                print(f"Error handling data: {e}")
+
+            conn.close()
+            #return received_data
+        
+     except Exception as e:
+        print(f"Error in create_server_socket: {e}")
+        # Gérez d'autres exceptions si nécessaire
+     finally:
+        server_socket.close()
+    
+    def start_server_sockets(self):
+        # Créez un dictionnaire pour stocker les informations sur les ports attribués à chaque client
+        self.client_ports = {}
+
+        # Chaque serveur écoute sur un port spécifique pour les connexions entrantes
+        port_index = 12345  # start port number
+        self.server_threads = []
+
+        for cluster_id, cluster_clients in enumerate(self.cluster_clients):
+            for client_id in cluster_clients:
+                port = port_index
+                port_index += 1  # increment the port number for each client
+
+                # Stockez le port attribué dans le dictionnaire client_ports
+                self.client_ports[client_id] = port
+
+                t = threading.Thread(target=self.create_server_socket, args=(f"Client {client_id}", port))
+                t.start()
+                self.server_threads.append(t)
+                print(t)
+                print(f"Client {client_id} (in Cluster {cluster_id}) listening on port {port}")
+
+
+    def send_messages_between_clients(self):
+        # Initialize client logic to connect to all servers
+        port_index = 12345  # start port number
+        for s_cluster_id, s_cluster in enumerate(self.cluster_clients):
+            for s_client_id in s_cluster:
+                for r_cluster_id, r_cluster in enumerate(self.cluster_clients):
+                  if  s_cluster_id==r_cluster_id:
+                    for r_client_id in r_cluster:
+                        if s_client_id != r_client_id or s_cluster_id != r_cluster_id:  # Avoid self-communication 
+                            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            try:
+                                client_socket.connect(('127.0.0.1', port_index + r_client_id))
+                                client_socket.sendall(pickle.dumps(f"Hello from Client {s_client_id} in Cluster {s_cluster_id} to Client {r_client_id} in Cluster {r_cluster_id}"))
+                                print(f"Client {s_client_id} sent: 'Hello' -> Client {r_client_id}")
+                                client_socket.close()
+                            except ConnectionRefusedError as e:
+                                print(f"Could not establish connection from Client {s_client_id} to Client {r_client_id}. Error: {e}")
+    def calculate_communication_rate(self, distance):
+        max_rate = 100  # Mbps à distance zéro
+        min_rate = 10   # Mbps à distance maximale
+        max_distance = 100  # Distance maximale pour la communication
+        rate = max(min_rate, max_rate - (distance / max_distance) * (max_rate - min_rate))
+        return rate 
+    def calculate_block_size(self, block):
+
+        block_data = pickle.dumps(block)
+        block_size_bytes = len(block_data)
+        block_size_megabits = block_size_bytes * 8 / 1e6  # Convertir en mégabits
+        return block_size_megabits
+    def find_closest_clients_between_clusters(self, clusters):
+        closest_clients = {}
+        cluster_distances = {}  # Ce dictionnaire gardera la distance entre les clusters
+
+        # Parcourir chaque paire de clusters pour trouver les clients les plus proches
+        for i, cluster_i in enumerate(clusters):
+            for j, cluster_j in enumerate(clusters):
+                if i < j:  # Éviter de comparer le même cluster ou de comparer les clusters dans les deux sens
+                    min_distance = float('inf')
+                    closest_pair = None
+
+                    # Parcourir tous les clients dans le cluster i
+                    for client_i in cluster_i:
+                        pos_i = self.client_positions[client_i]
+
+                        # Parcourir tous les clients dans le cluster j
+                        for client_j in cluster_j:
+                            pos_j = self.client_positions[client_j]
+                            distance = np.linalg.norm(pos_i - pos_j)
+
+                            # Si cette distance est la plus petite jusqu'à présent, mise à jour
+                            if distance < min_distance:
+                                min_distance = distance
+                                closest_pair = (client_i, client_j)
+
+                    # Enregistrer la paire de clients la plus proche pour les clusters i et j
+                    closest_clients[(i, j)] = closest_pair
+                    cluster_distances[(i, j)] = min_distance
+                    print(f"Distance la plus courte entre les clusters {i} et {j} est {min_distance} par les clients {closest_pair}.")
+
+        # Mise à jour de self.cluster_distances avec les distances entre les clusters
+        self.cluster_distances = cluster_distances
+        return closest_clients
+   
+    def record_communication_time(self, start_cluster, end_cluster, start_time, end_time):
+        key = (start_cluster, end_cluster) 
+        duration = end_time - start_time
+        if key not in self.communication_times:
+            self.communication_times[key] = []
+        self.communication_times[key].append(duration)
+
+    def calculate_throughput(self, distance):
+        base_throughput = 5  # Mbps, débit de base pour une distance de référence 
+        reference_distance = 0.1  # Distance de référence pour le débit de base
+        alpha=2
+
+        if distance <= reference_distance:
+            return base_throughput
+        else:
+            # Ajuster le débit en fonction de la distance
+            return base_throughput *(reference_distance/distance)**alpha
+          #  return throughput
+        
+    def send_block_with_controlled_throughput(self, socket, block_data, throughput, s_client_id, r_client_id):
+        packet_size = throughput *  1000000 // 8  # Taille du paquet en octets (débit en Kbps)
+        #10 ^ 3  # 12KB taille standard
+        num_packets = len(block_data) // packet_size + (1 if len(block_data) % packet_size > 0 else 0)
+        print(f"block size {len(block_data)} ")
+        # size = sys.getsizeof(block_data)
+        # print(f"size block ==== {size}")
+        
+        time1=time.time()
+
+        for i in range(int(num_packets)):
+            
+            start = int(i * packet_size)
+            end = int(start + packet_size)
+            packet = block_data[start:end]
+            socket.sendall(packet)
+            time_to_wait = packet_size / (throughput * 1024 / 8)
+            time.sleep(time_to_wait)
+            time.sleep(0.06) #0,06 
+        time2=time.time()
+        self.record_communication_time(s_client_id, r_client_id, time1, time2)
+        print(f" temp de communication : {time2-time1}")
+
+    
+    #############blochcahin############################
+    def share_validated_blocks_with_clusters(self, cluster_idx, validated_blocks):
+        
+        closest_clients = self.find_closest_clients_between_clusters(self.cluster_clients)
+        
+        for block in validated_blocks:
+            if not block.shared: 
+                # Simuler la réception du bloc par le cluster actuel (source)
+                self.receive_block(cluster_idx, block)
+            
+                # Parcourir tous les autres clusters pour partager le bloc
+                for target_cluster_idx, _ in enumerate(self.cluster_clients):
+                    
+                    if target_cluster_idx != cluster_idx:  # S'assurer de ne pas envoyer le bloc au cluster source
+                        # Utiliser les clients les plus proches pour la communication entre les clusters
+                        if (cluster_idx, target_cluster_idx) in closest_clients:
+                            s_client_id, r_client_id = closest_clients[(cluster_idx, target_cluster_idx)]
+                            distance = self.cluster_distances[(cluster_idx, target_cluster_idx)]
+                        elif (target_cluster_idx, cluster_idx) in closest_clients:  # Au cas où l'ordre est inversé
+                            r_client_id, s_client_id = closest_clients[(target_cluster_idx, cluster_idx)]
+                            distance = self.cluster_distances[(target_cluster_idx, cluster_idx)]
+                        else:
+                            continue  # Si aucun client proche n'est trouvé pour cette paire, passer à la suivante
+                        # Établir la connexion et envoyer le bloc
+                        receiver_port = self.client_ports[r_client_id]
+                        print(f"distance{distance}")
+                        throughput = self.calculate_throughput(distance)
+                     
+                        try:
+                            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            client_socket.connect(('127.0.0.1', receiver_port))
+                            block_data = pickle.dumps(block)
+                            self.send_block_with_controlled_throughput(client_socket, block_data, throughput, s_client_id, r_client_id)
+                            print(f"Block sent from Cluster {cluster_idx} client {s_client_id} to Cluster {target_cluster_idx} client {r_client_id}")
+                            
+                            # Simuler la réception du bloc par le cluster cible
+                            self.receive_block(target_cluster_idx, block)
+                            client_socket.close()
+                          #  print(f"time communication : {end_time-start_time}")
+                         #   self.record_communication_time(s_client_id, r_client_id, start_time, end_time)
+                            block_size_megabits = len(block_data) # Taille du bloc
+                            print(f"bloc size{block_size_megabits}")
+                            # print(f"Temps  pour envoyer le bloc de {cluster_idx} à {target_cluster_idx}: {temp_communication} secondes")
+
+
+                        except ConnectionRefusedError as e:
+                            print(f"Connection refused from Cluster {cluster_idx} to Cluster {target_cluster_idx}. Error: {e}")
+                        self.diffuser_bloc_au_cluster(validated_blocks, r_client_id, self.cluster_clients[target_cluster_idx], self.client_ports)
+                        
+                           
+                
+                block.shared = True
+                
+        
+    
+
+
+    def receive_block(self, receiving_cluster_idx, block):
+        """
+        Simule la réception d'un bloc par un cluster et enregistre le bloc dans la file d'attente de ce cluster.
+        """
+        # Ajouter le bloc à la file d'attente du cluster récepteur
+        self.validated_blocks_by_cluster[receiving_cluster_idx].append(block)
+        print(f"Cluster {receiving_cluster_idx} received and queued block from Cluster {block.client_id}")
+
+    def diffuser_bloc_au_cluster(self, validated_blocks, client_recepteur_id, clients_cluster, client_ports):
+        t1=time.time()
+        block_data = pickle.dumps(validated_blocks)
+        for client_id in clients_cluster:
+            if client_id != client_recepteur_id:  # Évitez d'envoyer à nouveau au client récepteur.
+                client_port = client_ports.get(client_id)
+                if client_port:
+                    try:
+                        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        client_socket.connect(('127.0.0.1', client_port))
+                        client_socket.sendall(block_data)
+                        print(f"Le client {client_recepteur_id} a envoyé le bloc au client {client_id} dans le cluster {clients_cluster}.")
+                    except Exception as e:
+                        print(f"Impossible d'envoyer le bloc du client {client_recepteur_id} au client {client_id}. Erreur : {e}")
+                    finally:
+                        client_socket.close()
+        t2=time.time()
+        t3=t2-t1
+        print(f"time de diffusion intra cluster qui a recu le bloc == {t3} dans le cluster {clients_cluster}")
+
+    #############blochcahin############################
+    def calculate_and_display_average_communication_times(self):
+        average_communication_times = {}
+        processed_keys = set()  # Ensemble pour stocker les clés déjà traitées
+
+        for key, times in self.communication_times.items():
+            # Vérifiez si la clé ou la clé inversée a déjà été traitée
+            reverse_key = (key[1], key[0])
+            if key not in processed_keys and reverse_key not in processed_keys:
+                # Si la clé inverse existe, combinez les temps et calculez la moyenne
+                if reverse_key in self.communication_times:
+                    total_times = times + self.communication_times[reverse_key]
+                    average_communication_times[key] = sum(total_times) / len(total_times)
+                else:
+                    # Sinon, utilisez uniquement les temps actuels pour cette clé
+                    average_communication_times[key] = sum(times) / len(times)
+                
+                # Marquez la clé et la clé inversée comme traitées
+                processed_keys.add(key)
+                processed_keys.add(reverse_key)
+        # Afficher les résultats
+        for key, avg_time in average_communication_times.items():
+            print(f"Average communication time between client {key[0]} and client {key[1]}: {avg_time} seconds")
+
+
+    # def communicate_closest_clients(self, closest_clients):
+    #  port_index = 12345  # start port number
+
+    #  for (s_cluster_id, r_cluster_id), (s_client_id, r_client_id) in closest_clients.items():
+    #     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    #     try:
+    #         client_socket.connect(('127.0.0.1', port_index + r_client_id))
+    #         client_socket.sendall(pickle.dumps(f"Hello from Client {s_client_id} in Cluster {s_cluster_id} to Client {r_client_id} in Cluster {r_cluster_id}"))
+    #         print(f"Client {s_client_id} sent: 'Hello' -> Client {r_client_id}")
+    #         client_socket.close()
+    #     except ConnectionRefusedError as e:
+    #         print(f"Could not establish connection from Client {s_client_id} to Client {r_client_id}. Error: {e}")
+
+
+    def divide_weights(self, model_weights: Dict[str, torch.Tensor], n_partitions: int) -> List[Dict[str, torch.Tensor]]:
+        """Divise les poids du modèle en plusieurs partitions."""
+        partitions = []
+        rn = [random.uniform(0, 1e6) for _ in range(n_partitions)]
+        sum_rn = sum(rn)
+
+        for i in range(n_partitions):
+            prn = rn[i] / sum_rn
+            partition = {k: v * prn for k, v in model_weights.items()}
+            #Multiplie chaque poids du modèle par le  prn pour obtenir une partition des poids
+            partitions.append(partition)  #Ajoute la partition créée à la liste des partitions
+        
+        return partitions
+         #la somme de toutes les partitions reconstituera les poids originaux du modèle.
+
+    def distribute_partitions(self, partitions: List[Dict[str, torch.Tensor]], client_ports: Dict[int, int], cluster_clients: List[int]) -> None:
+     n_clients = len(partitions)
+     client_weights = [{} for _ in range(n_clients)]
+
+     for i, partition in enumerate(partitions):
+        for j, weights in enumerate(partition):
+            client_idx = (i + j) % n_clients
+            specific_client = cluster_clients[client_idx]
+            client_port = client_ports.get(specific_client)
+            if client_port is None:
+                print(f"Client {client_idx} port not found, skipping.")
+                continue
+
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                client_socket.connect(('127.0.0.1', client_port))
+                weights_data = pickle.dumps(weights)
+                self.total_data_sent += len(weights_data)
+                client_socket.sendall(weights_data)
+             #   print(f"Sent weights to Client {client_idx} on port {client_port}")
+            except ConnectionRefusedError as e:
+                print(f"Could not establish connection to Client {client_idx}: {e}")
+            except BrokenPipeError as e:
+                print(f"Broken pipe to Client {client_idx}: {e}")
+            finally:
+                client_socket.close()
+            client_weights[client_idx][f"partition_{j}"] = weights
+            #print(f" weights to Client {client_weights} ")
+
+     return client_weights
+    
+    def print_communication_stats(self):
+        print(f"Total data sent: {self.total_data_sent} bytes")
+        print(f"Total data received: {self.total_data_received} bytes")
+
+    def calcule_subtotals(self, client_weights: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
+        return [{k: sum([partition[k] for partition in partitions.values()]) for k in client_weights[0]["partition_0"]} for partitions in client_weights]
+    def send_subtotals_within_client(self, cluster_clients: List[int], subtotals: List[Dict[str, torch.Tensor]]):
+     cluster_sockets = {}
+
+     for sender_client in cluster_clients:
+        sender_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sender_socket.connect(('127.0.0.1', self.client_ports[sender_client]))
+            cluster_sockets[sender_client] = sender_socket
+            print(f"Client {sender_client} connected to port {self.client_ports[sender_client]}")
+        except Exception as e:
+            print(f"Error connecting to port for Client {sender_client}: {e}")
+
+   #  time.sleep(1)  # Vous pouvez ajuster le délai si nécessaire
+    # Envoyez les sous-totaux aux autres clients du cluster
+     for sender_client in cluster_clients:
+        sender_subtotal = subtotals[sender_client]
+
+        for receiver_client in cluster_clients:
+            if sender_client != receiver_client:
+                receiver_socket = cluster_sockets[receiver_client]
+                try:
+                    receiver_socket.sendall(pickle.dumps(sender_subtotal))
+                    print(f"Client {sender_client} sent subtotal to Client {receiver_client}")
+                except Exception as e:
+                    print(f"Error sending subtotal from Client {sender_client} to Client {receiver_client}: {e}")
+
+    # Fermez les sockets après la communication
+     for client_socket in cluster_sockets.values():
+        client_socket.close()
+    
+    def decentralized_average(self, subtotals: List[Dict[str, torch.Tensor]], client_idx: int) -> Dict[str, torch.Tensor]:
+ 
+    # Initialize average_weights with zero tensors
+     average_weights = {k: torch.zeros_like(v) for k, v in subtotals[0].items()}
+
+    # Each client adds its own subtotal to the subtotals of other clients
+     for subtotal in subtotals:
+        for key, value in subtotal.items():
+            average_weights[key] += value
+
+    # Each client calculates the average independently
+     for key in average_weights.keys():
+        average_weights[key] /= len(subtotals)
+
+    # Mettre à jour le modèle local avec la moyenne des poids
+    
+     self.avrg.load_state_dict(average_weights)
+     return average_weights
+    
+###############Blockchain###############################
+    def assign_tokens_to_clients(self,cluster_clients):
+        # Attribuer un certain nombre de jetons(stake) à chaque client
+      #  for cluster_idx, cluster_clients in enumerate(self.cluster_clients):
+            for client_idx in cluster_clients:
+                #le nombre de jetons est aleatoir ici 
+                self.client_tokens[client_idx] = random.randint(1, 10)
+             #   print(f" tokern client {client_idx}= {self.client_tokens[client_idx]}")
+  
+    def validate_block_with_pos(self, cluster_clients, client_ports):
+        #  le PoS pour valider le bloc
+        #basé sur  la distribution de jetons aux clients, la décision des clients de participer à la validation en fonction de leurs jetons et le seuil de validation
+        cluster_clients_key = tuple(cluster_clients)
+        start_time = time.time()
+        total_tokens = sum(self.client_tokens[client_idx] for client_idx in cluster_clients) #la somme totale de jetons de tous les clients dans le cluster
+        validation_threshold = total_tokens * 0.8  # Seuil de validation basé sur les jetons (stake)
+
+    # Creer a weighted list of clients en se basant sur their stake
+        prob = [self.client_tokens[client_id] for client_id in cluster_clients]
+        weighted_clients = random.choices(cluster_clients, weights=prob, k=len(cluster_clients))
+        # Initialize validated tokens and validators list
+        block_validated = 0
+        validators = []
+        t3=0
+        # Select validators based on weighted random choice
+        for client_id in weighted_clients:
+            t3=0
+            t1=time.time()
+            if block_validated >= validation_threshold:
+                break  
+            block_validated += self.client_tokens[client_id]
+            validators.append(client_id)
+
+            for other_client_id in weighted_clients:
+               if client_id != other_client_id:
+                 self.inform_client_of_validation(client_id, other_client_id, client_ports, block_validated)
+            t2=time.time()
+            t3=t2-t1
+            print(f"Le client {client_id} a pris :{t3} second pour valider le bloc")
+
+              
+        if block_validated >= validation_threshold:
+            end_time = time.time()
+            validation_time = (end_time - start_time)
+            validation_time_float = float(validation_time)
+            self.block_validation_times[cluster_clients_key].append(validation_time_float)
+            print(f"Times in block_validation_times for {cluster_clients_key}: {self.block_validation_times[cluster_clients_key]}")
+
+
+        return block_validated >= validation_threshold #quand la somme des jetons des clients dans le cluster dépasse ou = le seuil de validation donc le la condition est satisfait  et le bloc est validé
+    
+
+    def inform_client_of_validation(self, validator_id, other_client_id, client_ports, block_validated):
+        
+        message = f"Client {validator_id} a participé à la validation du bloc, la somme des tokens = {block_validated}"
+        client_port = client_ports.get(other_client_id)
+        if client_port:
+            try:
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client_socket.connect(('127.0.0.1', client_port))
+                client_socket.sendall(pickle.dumps(message))
+
+                
+                
+                print(f"Client {validator_id} informe Client {other_client_id} about participation in validation.")
+            except Exception as e:
+                print(f"Could not send message from Client {validator_id} to Client {other_client_id}. Error: {e}")
+            finally:
+                client_socket.close()
+    def communication_intra_cluster_blockchain(self, cluster_clients,cluster_idx, validated_blocks, client_ports):
+        closest_clients = self.find_closest_clients_between_clusters(self.cluster_clients)
+        print(f"closest_clientsr ===={closest_clients}")
+
+        for (pair_key, client_pair) in closest_clients.items():
+            if cluster_idx in pair_key:
+              target_client_id = client_pair[0] if pair_key[0] == cluster_idx else client_pair[1]
+
+              block_data = pickle.dumps(validated_blocks)
+              
+              client_port = client_ports.get(target_client_id)
+              if client_port:
+               try:
+                time1=time.time()
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client_socket.connect(('127.0.0.1', client_port))
+                client_socket.sendall(block_data)
+                centre_de_cluster=self.cluster_centers[cluster_idx]
+            
+                print(f"centre de cluster {centre_de_cluster} envoye le bloc au client{target_client_id}.")
+               except Exception as e:
+                print(f"Could not send message from cnetre {centre_de_cluster} to Client {target_client_id}. Error: {e}")
+               finally:
+                client_socket.close()
+               time2=time.time()
+               time3=time2-time1
+               print(f"time de duffision dans le cluster {cluster_idx} est :::::: {time3}")
+
+               #break
+            
+##########Blockchain###############################  
+
+
+    def cluster_clients_distance(self, K: int, n_clients: int, R: float) -> List[List[int]]:
+     """Cluster clients using distance based clustering.
+
+     Args:
+        K (int): Number max of clusters.
+        n_clients (int): Total number of clients.
+        R (float): Maximum distance for communication within a cluster.
+
+     Returns:
+        List[List[int]]: List of cluster assignments for each client.
+     """
+    # Generate clustering features for each client
+     np.random.seed(25)
+
+     client_features = np.random.rand(n_clients, 2)
+     self.client_positions = {client_id: position for client_id, position in enumerate(client_features)}
+
+     k0 = 1
+     F = 12
+     clusters_final = False
+     while not clusters_final:
+        kmeans = KMeans(n_clusters=k0, init='k-means++', n_init=10).fit(client_features)
+        
+        clusters = [[] for _ in range(k0)]
+
+        for client_idx, cluster_idx in enumerate(kmeans.labels_):
+            clusters[cluster_idx].append(client_idx)
+
+        clusters_final = True
+        d_max = 0
+        for cluster in clusters:
+            if len(cluster) > F: # verifier le F : nombre max des clients dans les clusters
+                clusters_final = False
+               # break
+
+            for i in range(len(cluster)):
+                for j in range(i + 1, len(cluster)): 
+                    distance_paire = np.linalg.norm(client_features[cluster[i]] - client_features[cluster[j]])
+                    d_max = max(d_max, distance_paire)
+        if clusters_final:
+            if d_max <= R:
+                break
+            else: 
+                k0 += 1
+                clusters_final = False
+       
+        # if d_max <= R or clusters_final:
+        #     break  # Stop clustering 
+        elif d_max >= R or not clusters_final:
+          k0 += 1
+          clusters_final = False
+
+        # if d_max > R or not clusters_final: 
+        #     k0 += 1
+        #     clusters_final = False
+        # else:
+        #     break  
+
+     cluster_coordinates = [[] for _ in range(k0)]
+     for cluster_idx, clients_in_cluster in enumerate(clusters):
+        for client_idx in clients_in_cluster:
+            cluster_coordinates[cluster_idx].append(client_features[client_idx])
+
+    # Plot the cluster points
+     texts = []
+     vertical_offset = 5
+     for cluster_idx, cluster_clients in enumerate(clusters):
+        cluster_x, cluster_y = zip(*cluster_coordinates[cluster_idx])
+        plt.scatter(cluster_x, cluster_y, label=f'Cluster {cluster_idx}')
+        texts = []
+        for client_idx in cluster_clients:
+          x, y = client_features[client_idx]
+          horizontal_offset = (client_idx % 10 - 5) 
+          text =plt.annotate(client_idx, 
+                     (x, y),
+                     textcoords="offset points", # Positionnement du texte
+                     xytext=(horizontal_offset, vertical_offset), 
+                     ha='center',
+                     fontsize=6)
+          texts.append(text)
+
+    # Configure the plot
+     plt.title('Clustering')
+     plt.xlabel('X-Axis (Km)')
+     plt.ylabel('Y-Axis (Km)')
+     plt.legend()
+     plt.show()
+     self.cluster_centers = kmeans.cluster_centers_
+     print(f"Centre du cluster 1: {self.cluster_centers[1]}")
+     for center_id, center in enumerate(self.cluster_centers):
+        print(f"Centre du cluster {center_id}: {center}")
+
+     return clusters
+   
+   
+    def __init__(self, args: Dict[str, Any]):
+        super().__init__(args)
+        
+        self.cluster_centers = None
+        self.client_weights_norms = {}  # Stocke la norme des poids pour chaque client
+        self.global_avg_weights_norm = None
+        self.cluster_accuracies = []
+        self.f1_scoree = []
+        self.precision = []
+        self.cluster_distances = {}
+        self.ledger = [] # Ajouter un ledger vide pour stocker les blocs
+        # Utilize custom distance-based clustering
+        self.cluster_clients = self.cluster_clients_distance(
+            self.args.K, self.args.n_clients, self.args.R
+        )
+        self.blocks_received_by_cluster = {cluster_idx: [] for cluster_idx in range(len(self.cluster_clients))}
+        self.validated_blocks_by_cluster = {cluster_idx: [] for cluster_idx in range(len(self.cluster_clients))}
+        self.client_tokens = {}
+        self.start_server_sockets()  
+        self.block_queues = {cluster_idx: Queue() for cluster_idx in range(len(self.cluster_clients))}
+        closest_clients = self.find_closest_clients_between_clusters(self.cluster_clients)
+        self.total_data_sent = 0
+        self.total_data_received = 0
+        self.communication_delays = []
+        self.block_validation_times = {tuple(clients): [] for clients in self.cluster_clients}
+        self.block_validation_times_lock = Lock()
+        self.communication_times = {}
+        self.initial_model_state = copy.deepcopy(self.avrg.state_dict())
+        
+        
+        
+       
+        # self.client_positions = np.random.rand(self.args.n_clients, 2)  # Positions initiales
+        # self.client_destinations = np.random.rand(self.args.n_clients, 2)  # Destinations initiales
+        # self.client_speeds = np.random.uniform(low=0.1, high=1.0, size=self.args.n_clients)  # Vitesse de déplacement
+        # self.client_pause_times = np.zeros(self.args.n_clients)
+
+      #  self.communicate_closest_clients(closest_clients)
+
+    def train_cluster(self, cluster_clients: List[int]) -> None:
+        """Train a server model for a specific cluster of clients."""
+        self.avrg.load_state_dict(self.initial_model_state) 
+        train_losses = []
+        cluster_accuracies = []
+        f1score = []
+        precisions = []
+        cluster_accuracy_list = []
+        current_cluster = cluster_clients
+        current_cluster_key = tuple(current_cluster)
+        cluster_id = None
+        for idx, cluster in enumerate(self.cluster_clients):
+            if set(cluster_clients).issubset(cluster):
+                cluster_id = idx
+                break
+
+        
+        self.assign_tokens_to_clients(cluster_clients)
+
+        for epoch in range(self.args.n_epochs):
+            
+        #   if verification():
+        #     #
+        #   else :
+        #     continue
+            # if epoch % 1 == 0:
+            #     self.update_client_positions()
+            #     self.cluster_clients = self.cluster_clients_distance(
+            #         self.args.K, self.args.n_clients, self.args.R
+            #     )
+            clients_models = []
+            clients_losses = []
+
+            # Train clients in the cluster
+            self.avrg.train()
+
+            for client_idx in cluster_clients:
+                # Set client in the sampler
+                self.train_loader.sampler.set_client(client_idx)
+
+                # Train client
+                client_model, client_loss = self._train_client(
+                    avrg=self.avrg,
+                    train_loader=self.train_loader,
+                    client_idx=client_idx,
+                )
+                
+                #print(client_model.state_dict().keys())
+           #     self.client_weights_norms[client_idx] = client_model.state_dict()['fc.2.weight'].cpu().numpy()
+                clients_models.append(client_model)
+                clients_losses.append(client_loss)
+
+
+
+            # Diviser les poids
+           # partitions = [self.divide_weights(model_weights, len(clients_models)) for model_weights in clients_models]
+            partitions = [self.divide_weights(client_model.state_dict(), len(clients_models)) for client_model in clients_models]
+
+            # Distribuer les partitions
+            distributed_weights = self.distribute_partitions(partitions, self.client_ports, cluster_clients)
+
+
+            # Calculer les sous-totaux pour chaque client
+            subtotals = self.calcule_subtotals(distributed_weights)
+         #   self.send_subtotals_within_cluster(cluster_clients, subtotals)
+            
+
+            for i, client_model in enumerate(clients_models):
+                average_update = self.decentralized_average(subtotals, cluster_clients[i])
+
+                # Assurez-vous que client_model est une instance de nn.Module
+                if isinstance(client_model, nn.Module):
+                    average_state_dict = average_update
+                    client_model.load_state_dict(average_state_dict)
+                else:
+                    raise TypeError("client_model is not an instance of nn.Module")
+            
+            
+            # start_validation_time = time.time()
+            is_block_validated = self.validate_block_with_pos(cluster_clients, self.client_ports)
+            if is_block_validated:
+             
+                
+                block_data = {"epoch": epoch, "cluster_clients": cluster_clients, "poid": average_update, "timestamp": time.time()}
+
+                if self.validated_blocks_by_cluster:
+                    last_cluster_idx = list(self.validated_blocks_by_cluster.keys())[-1]
+                    previous_block_hash = self.validated_blocks_by_cluster[last_cluster_idx][-1].hash if self.validated_blocks_by_cluster[last_cluster_idx] else "0"
+                else: 
+                    previous_block_hash = "0"
+                new_block = Block(previous_block_hash, block_data, self.args.device)
+                self.communication_intra_cluster_blockchain(cluster_clients,cluster_id, [new_block], self.client_ports)
+                self.share_validated_blocks_with_clusters(cluster_id, [new_block])
+
+
+                print(f"Cluster Clients {cluster_clients} validated the block in epoch {epoch}")
+            
+            else:
+                print(f" Block not validated. Skipping ledger update.")
+            
+
+            
+
+
+
+
+           
+
+
+            # Update average loss of this round
+           # Update average loss of this round
+            avg_loss = sum(clients_losses) / len(clients_losses)
+            train_losses.append(avg_loss)
+            
+            
+
+            if (epoch + 1) % self.args.log_every == 0:
+                # Test server model
+                total_loss, total_acc, f1_score, precision = self.test()
+                print(f"---> Avg Test Loss: {total_loss} | Avg Test Accuracy: {total_acc}\n")
+                cluster_accuracy_list.append(total_acc)
+                f1score.append(f1_score)
+                precisions.append(precision)
+
+                
+               # cluster_accuracy_list.append(total_acc)
+                avg_train_loss = sum(train_losses) / len(train_losses)
+
+                # Log results
+                logs = {
+                    "train/loss": avg_train_loss,
+                    "test/loss": total_loss,
+                    "test/acc": total_acc,
+                    "round": epoch,
+                    "test/f1_score": f1_score,
+                    "test/precision": precision,
+                }
+              #  cluster_accuracy_list.append(total_acc)
+                if total_acc >= self.target_acc and self.reached_target_at is None:
+                    self.reached_target_at = epoch
+                    logs["reached_target_at"] = self.reached_target_at
+                    print(
+                        f"\n -----> Target accuracy {self.target_acc} reached at round {epoch}! <----- \n"
+                    )
+
+                self.logger.log(logs)
+
+                # Print results to CLI
+                print(f"\n\nResults after {epoch + 1} rounds of training: {cluster_clients}")
+                print(f"---> Avg Training Loss: {avg_train_loss}")
+                print(f"---> Avg Test Loss: {total_loss} | Avg Test Accuracy: {total_acc}| f1 score: {f1_score}| precision: {precision}\n")
+                
+
+
+                # Early stopping
+                if self.args.early_stopping and self.reached_target_at is not None:
+                    print(f"\nEarly stopping at round #{epoch}...")
+                    break
+        #self.avrg.load_state_dict(self.initial_model_state)
+        
+
+        self.cluster_accuracies.append(cluster_accuracy_list)
+        self.f1_scoree.append(f1score)
+        self.precision.append(precisions)
+        #fed_avg.print_communication_stats() 
+    def train_cluster_parallel(self):
+            threads = []
+        
+            for cluster_idx, cluster_clients in enumerate(self.cluster_clients):
+                print(f"Training Cluster {cluster_idx}: {cluster_clients}")
+                thread = threading.Thread(target=self.train_cluster, args=(cluster_clients,))    
+                
+                threads.append(thread)
+                thread.start()
+
+                
+
+            for thread in threads:
+                thread.join()
+            self.calculate_and_display_average_communication_times()
+
+   
+    
+
+if __name__ == "__main__":
+    args = arg_parser()
+    fed_avg = FedAvgClustered(args)
+    fed_avg.train_cluster_parallel()
+    
+    # fed_avg.print_communication_stats()
+  
+
+    cluster_results = []  
+   # cluster_accuracies = []
+    # for cluster_idx, cluster_clients in enumerate(fed_avg.cluster_clients):
+    #     print(f"Training Cluster {cluster_idx}: {cluster_clients}")
+    #     fed_avg.train_cluster(cluster_clients)
+    #     # cluster_accuracy_list = fed_avg.cluster_accuracies[-1]
+    #     # total_loss, total_acc, f1score, precision = fed_avg.test()  # Tester le modèle pour ce cluster
+        
+
+  
+        
+
+    # Afficher les résultats de tous les clusters en même temps
+    for cluster_idx, cluster_clients, total_loss, total_acc in cluster_results:
+        print(f"Cluster {cluster_idx} (Clients {cluster_clients}) | Test Loss: {total_loss} | Test Accuracy: {total_acc}")
+   
+    plt.figure(figsize=(10, 6))
+    for cluster_idx, accuracies in enumerate(fed_avg.cluster_accuracies):
+        print(f"\n accuracies {accuracies}")
+        plt.plot(range(len(accuracies)), accuracies, label=f"Cluster {cluster_idx}")
+    plt.xlabel("Iteration")
+    plt.ylabel("Accuracy")
+    plt.title("Accuracy Changes per Iteration for Each Cluster")
+    plt.legend()
+    plt.show()
+
+
+    for cluster_idx, f1score in enumerate(fed_avg.f1_scoree):
+        print(f"\n f1 score {f1score}")
+        plt.plot(range(len(f1score)), f1score, label=f"Cluster {cluster_idx}")
+    plt.xlabel("Iteration")
+    plt.ylabel("f1score")
+    plt.title("f1 score Changes per Iteration for Each Cluster")
+    plt.legend()
+    plt.show()
+
+
+    for cluster_idx, precisions in enumerate(fed_avg.precision):
+        print(f"\n f1 score {precisions}")
+        plt.plot(range(len(precisions)), precisions, label=f"Cluster {cluster_idx}")
+    plt.xlabel("Iteration")
+    plt.ylabel("precision")
+    plt.title("precision Changes per Iteration for Each Cluster")
+    plt.legend()
+    plt.show()
+    
+   # Afficher les normes des poids
+    print("\n\n--- Client Weights ---")
+    for client_id, weight_norm in fed_avg.client_weights_norms.items():
+        print(f"Client {client_id}: {weight_norm}")
+ 
+    cluster_ledgers = {}
+
+
+    for cluster_idx, cluster_blocks in fed_avg.validated_blocks_by_cluster.items():
+    # Triez les blocs par horodatage pour ce cluster
+     sorted_blocks = sorted(cluster_blocks, key=lambda block: block.timestamp)
+
+    # Créez un ledger (une liste)
+    #  pour ce cluster
+     cluster_ledger = []
+     all_blocks_delays = {}
+    # Parcourez les blocs triés et ajoutez-les au ledger du cluster
+     for block in sorted_blocks:
+        cluster_ledger.append(block)
+        add_to_ledger_time = time.time()
+        delay = add_to_ledger_time - block.timestamp
+        
+        
+
+    # Triez à nouveau le ledger par horodatage au cas où
+     cluster_ledger = sorted(cluster_ledger, key=lambda block: block.timestamp)
+
+    # Ajoutez le ledger du cluster au dictionnaire
+     cluster_ledgers[cluster_idx] = cluster_ledger
+
+   
+   
+    for cluster_idx, cluster_ledger in cluster_ledgers.items():
+        print(f"Cluster {cluster_idx} Ledger:")
+        for block in cluster_ledger:
+            print(f"Block Hash: {block.hash}")
+          #  print(f"Timestamp: {block.timestamp}")
+            print(f"Previous Hash: {block.previous_hash}")
+            print(f"Data: {block.data}")
+            print()
+
+
+
+
+            
+    for cluster_idx, times in fed_avg.block_validation_times.items():
+      print(f"Cluster {cluster_idx} times before calculating stats: {times}")
+      

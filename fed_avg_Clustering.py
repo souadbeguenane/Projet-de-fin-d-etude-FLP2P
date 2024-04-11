@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
 
 from data import MNISTDataset, FederatedSampler
 from models import CNN, MLP
@@ -153,41 +154,98 @@ class FedAvgClustered(FedAvg):
    
 
     def cluster_clients_distance(self, K: int, n_clients: int, R: float) -> List[List[int]]:
-        """Cluster clients using distance based clustering.
+     """Cluster clients using distance based clustering.
 
-        Args:
-            K (int): Number max of clusters.
-            n_clients (int): Total number of clients.
-            R (float): Maximum distance for communication within a cluster.
+     Args:
+        K (int): Number max of clusters.
+        n_clients (int): Total number of clients.
+        R (float): Maximum distance for communication within a cluster.
 
-        Returns:
-            List[List[int]]: List of cluster assignments for each client.
-        """
-        # Générer des caractéristiques de clustering  pour chaque client
-        client_features = np.random.rand(n_clients, 2)
+     Returns:
+        List[List[int]]: List of cluster assignments for each client.
+     """
+    # Generate clustering features for each client
+     np.random.seed(25)
 
-        k0 = 1
-        d_max = 2
+     client_features = np.random.rand(n_clients, 2)
+     self.client_positions = {client_id: position for client_id, position in enumerate(client_features)}
 
-        while d_max > R and k0 < K:
-            k0 += 1
+     k0 = 1
+     F = 12
+     clusters_final = False
+     while not clusters_final:
+        kmeans = KMeans(n_clusters=k0, init='k-means++', n_init=10).fit(client_features)
+        
+        clusters = [[] for _ in range(k0)]
 
-            # Initialize cluster centers
-            kmeans = KMeans(n_clusters=k0, init='k-means++', n_init=1).fit(client_features)
-            cluster_centers = kmeans.cluster_centers_ #les centres trouvé en utilisant le Kmeans
+        for client_idx, cluster_idx in enumerate(kmeans.labels_):
+            clusters[cluster_idx].append(client_idx)
 
-            # Assign clients to the nearest cluster center
-            distances = np.linalg.norm(client_features[:, np.newaxis, :] - np.array(cluster_centers), axis=2)# pour calculer les distances entre chaque point et chaque centre de cluster
-            nearest_centers = np.argmin(distances, axis=1)# détermine le centre de cluster le plus proche pour chaque point
+        clusters_final = True
+        d_max = 0
+        for cluster in clusters:
+            if len(cluster) > F: # verifier le F : nombre max des clients dans les clusters
+                clusters_final = False
+               # break
 
-            # Organize clients into cluster lists
-            clusters = [[] for _ in range(k0)]
-            for client_idx, cluster_idx in enumerate(nearest_centers):
-                clusters[cluster_idx].append(client_idx)
+            for i in range(len(cluster)):
+                for j in range(i + 1, len(cluster)): 
+                    distance_paire = np.linalg.norm(client_features[cluster[i]] - client_features[cluster[j]])
+                    d_max = max(d_max, distance_paire)
+        if clusters_final:
+            if d_max <= R:
+                break
+            else: 
+                k0 += 1
+                clusters_final = False
+       
+        # if d_max <= R or clusters_final:
+        #     break  # Stop clustering 
+        elif d_max >= R or not clusters_final:
+          k0 += 1
+          clusters_final = False
 
-            d_max = np.max([np.linalg.norm(client_features[cluster] - cluster_centers[i]) for i, cluster in enumerate(clusters) ]) #calcule la nouvelle distance maximale entre les points et les centres dans les clusters actuels
-            
-        return clusters
+        # if d_max > R or not clusters_final: 
+        #     k0 += 1
+        #     clusters_final = False
+        # else:
+        #     break  
+
+     cluster_coordinates = [[] for _ in range(k0)]
+     for cluster_idx, clients_in_cluster in enumerate(clusters):
+        for client_idx in clients_in_cluster:
+            cluster_coordinates[cluster_idx].append(client_features[client_idx])
+
+    # Plot the cluster points
+     texts = []
+     vertical_offset = 5
+     for cluster_idx, cluster_clients in enumerate(clusters):
+        cluster_x, cluster_y = zip(*cluster_coordinates[cluster_idx])
+        plt.scatter(cluster_x, cluster_y, label=f'Cluster {cluster_idx}')
+        texts = []
+        for client_idx in cluster_clients:
+          x, y = client_features[client_idx]
+          horizontal_offset = (client_idx % 10 - 5) 
+          text =plt.annotate(client_idx, 
+                     (x, y),
+                     textcoords="offset points", # Positionnement du texte
+                     xytext=(horizontal_offset, vertical_offset), 
+                     ha='center',
+                     fontsize=6)
+          texts.append(text)
+
+    # Configure the plot
+     plt.title('Clustering')
+     plt.xlabel('X-Axis (Km)')
+     plt.ylabel('Y-Axis (Km)')
+     plt.legend()
+     plt.show()
+     self.cluster_centers = kmeans.cluster_centers_
+     print(f"Centre du cluster 1: {self.cluster_centers[1]}")
+     for center_id, center in enumerate(self.cluster_centers):
+        print(f"Centre du cluster {center_id}: {center}")
+
+     return clusters
 
     def __init__(self, args: Dict[str, Any]):
         super().__init__(args)
@@ -285,4 +343,6 @@ if __name__ == "__main__":
         print(f"Cluster {cluster_idx} (Clients {cluster_clients}) | Test Loss: {total_loss} | Test Accuracy: {total_acc}")
     for client_id, weight_norm in fed_avg.client_weights_norms.items():
         print(f"Client {client_id}: {weight_norm}")
+    
+
     
